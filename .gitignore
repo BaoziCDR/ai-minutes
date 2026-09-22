@@ -1,0 +1,20 @@
+node_modules/
+dist/
+release/
+coverage/
+.qa/
+*.log
+*.env
+.env.*
+*.secret
+.DS_Store
+build/icon.iconset/
+# Runtime user data never belongs in this repository.
+settings.json
+bootstrap.json
+meetings/
+*.wav
+*.mp3
+*.m4a
+summary-response.json
+summary-schema.json

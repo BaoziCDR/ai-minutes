@@ -1,0 +1,75 @@
+{
+  "name": "ai-minutes",
+  "version": "1.1.0",
+  "private": true,
+  "description": "AI 纪要 · AI Minutes",
+  "author": "Jume",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit && vite build",
+    "start": "electron .",
+    "test": "node --test tests/*.test.cjs",
+    "pack": "electron-builder --mac dir --arm64",
+    "dist": "electron-builder --mac dmg --arm64",
+    "test:desktop": "npm run build && node tests/desktop.e2e.cjs",
+    "format": "prettier --write electron src tests vite.config.ts package.json tsconfig.json"
+  },
+  "dependencies": {
+    "lucide-react": "^0.468.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.1.0",
+    "electron": "^40.0.0",
+    "electron-builder": "^26.0.0",
+    "mermaid": "^11.12.0",
+    "playwright": "^1.58.0",
+    "prettier": "^3.9.8",
+    "typescript": "^5.9.0",
+    "vite": "^7.3.0"
+  },
+  "build": {
+    "appId": "com.jume.shengye",
+    "productName": "AI 纪要",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": [
+        "dir",
+        "dmg"
+      ],
+      "identity": null,
+      "icon": "build/icon.icns",
+      "extendInfo": {
+        "NSMicrophoneUsageDescription": "AI 纪要需要使用麦克风记录会议，并将音频发送到你配置的识别服务生成实时字幕。"
+      }
+    },
+    "dmg": {
+      "title": "AI 纪要",
+      "contents": [
+        {
+          "x": 150,
+          "y": 180
+        },
+        {
+          "x": 430,
+          "y": 180,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ]
+    }
+  }
+}
