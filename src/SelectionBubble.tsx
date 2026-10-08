@@ -188,7 +188,7 @@ export function SelectionBubble({
           <X size={15} />
         </button>
       </div>
-      {annotation ? (
+      {annotation && (
         <div className="bubble-note">
           <div className="bubble-saved">
             <Check size={12} />
@@ -227,8 +227,6 @@ export function SelectionBubble({
             </button>
           )}
         </div>
-      ) : (
-        <p className="bubble-hint">选择一个类型，立即标记这段原文</p>
       )}
     </div>
   );

@@ -1,4 +1,17 @@
-import React, { useState, useEffect, useRef, useCallback } from "react";
+import { SpeechSettings, SpeechBindingSelect } from "./SpeechSettings";
+import { AudioReviewView } from "./AudioReviewView";
+import type { SpeechConfig, SpeechBinding } from "./types";
+import { CodexModelPicker } from "./CodexModelPicker";
+import { waveformHeights } from "./waveform";
+import { ShortcutRecorder, displayShortcut } from "./ShortcutRecorder";
+import { useSettingsAutosave } from "./useSettingsAutosave";
+import React, {
+  useState,
+  useEffect,
+  useRef,
+  useCallback,
+  useMemo,
+} from "react";
 import { createRoot } from "react-dom/client";
 import {
   AudioLines,
@@ -83,8 +96,10 @@ function label(m: Meeting, s: string) {
   return (
     m.speakers[s] ||
     (s === "-1"
-      ? "待确认"
-      : `说话人 ${String.fromCharCode(65 + (Number(s.split(":").at(-1)) || 0))}`)
+      ? "未区分说话人"
+      : s.includes(":")
+        ? `片段 ${Number(s.split(":")[0].split("-").at(-1)) + 1} · 说话人 ${String.fromCharCode(65 + (Number(s.split(":").at(-1)) || 0))}`
+        : `说话人 ${String.fromCharCode(65 + (Number(s) || 0))}`)
   );
 }
 function color(s: string) {
@@ -98,7 +113,11 @@ function status(m: Meeting) {
         ready: "待开始",
         recording: "录制中",
         paused: "已暂停",
-        completed: m.summary ? "已整理" : "待整理",
+        completed: m.summaryStale
+          ? "待重新整理"
+          : m.summary
+            ? "已整理"
+            : "待整理",
         interrupted: "已恢复",
         transcribing: "转写中",
       } as Record<string, string>
@@ -308,13 +327,24 @@ function App() {
         await recorder.current?.pause();
         await api.pause();
       } else if (action === "resume") {
+        if (!recorder.current)
+          throw Error("录音设备已释放，请结束当前会议后重新开始。");
         await api.resume();
-        await recorder.current?.resume();
+        try {
+          await recorder.current.resume();
+        } catch (e) {
+          await api.pause();
+          throw e;
+        }
       } else {
         await recorder.current?.close();
         recorder.current = null;
-        await api.stop();
-        notify("录音与转写已保存");
+        const stopped = await api.stop();
+        notify(
+          stopped?.status === "transcribing"
+            ? "录音已保存，正在会后转写"
+            : "录音与转写已保存",
+        );
       }
     } catch (e) {
       notify((e as Error).message, true);
@@ -404,12 +434,7 @@ function App() {
         <button className="new-meeting" onClick={() => setNewOpen(true)}>
           <Plus size={18} />
           新建会议
-          <span>
-            {settings?.shortcuts?.newMeeting
-              ?.replace("CommandOrControl", "⌘")
-              .replace("Alt", "⌥")
-              .replace(/\+/g, " ")}
-          </span>
+          <span>{displayShortcut(settings?.shortcuts?.newMeeting || "")}</span>
         </button>
         <nav>
           <button
@@ -496,7 +521,7 @@ function App() {
             <ChevronRight size={16} />
           </button>
           <div className="sidebar-footer">
-            <span>AI 纪要 1.0</span>
+            <span>AI 纪要 1.2.1</span>
             <span>让讨论留下回响</span>
           </div>
         </div>
@@ -586,7 +611,7 @@ function App() {
                     值得被好好记住。
                   </h2>
                   <p>
-                    实时区分每一位发言人，圈出重要的原话。
+                    录音与原文一同保存，圈出重要的原话。
                     <br />
                     会后，一份清晰的纪要与思维导图就准备好了。
                   </p>
@@ -924,11 +949,19 @@ function Workspace({
     [note, setNote] = useState(""),
     [edit, setEdit] = useState<Segment | null>(null),
     [showSpeakers, setShowSpeakers] = useState(false),
+    [dismissedSummaryRevision, setDismissedSummaryRevision] = useState<
+      string | null
+    >(null),
+    [deleteBlock, setDeleteBlock] = useState<Segment | null>(null),
     [rename, setRename] = useState(false),
     [title, setTitle] = useState(m.title),
     [menu, setMenu] = useState(false),
     [exportBusy, setExportBusy] = useState(false),
     [annEdit, setAnnEdit] = useState<Annotation | null>(null),
+    [transcriptionChoice, setTranscriptionChoice] =
+      useState<SpeechConfig | null>(null),
+    [transcriptionBinding, setTranscriptionBinding] =
+      useState<SpeechBinding | null>(null),
     [position, setPosition] = useState(0),
     [playing, setPlaying] = useState(false),
     [speed, setSpeed] = useState(1),
@@ -938,9 +971,20 @@ function Workspace({
     scroll = useRef<HTMLDivElement>(null);
   const live = ["recording", "paused", "transcribing"].includes(m.status);
   const isRecord = m.status === "recording";
-  const people = Array.from(new Set(m.segments.map((s) => s.speaker))).filter(
-    (s) => s !== "-1",
+  const summaryRevision = useMemo(
+    () =>
+      JSON.stringify([
+        m.id,
+        m.segments,
+        m.speakers,
+        m.annotations,
+        m.summaryGeneratedAt,
+      ]),
+    [m.id, m.segments, m.speakers, m.annotations, m.summaryGeneratedAt],
   );
+  const people = Array.from(
+    new Set([...m.segments.map((s) => s.speaker), ...Object.keys(m.speakers)]),
+  ).filter((s) => s !== "-1");
   useEffect(() => {
     if (follow && isRecord)
       bottom.current?.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -1037,7 +1081,11 @@ function Workspace({
             </span>
             <button onClick={() => setShowSpeakers(true)}>
               <Users size={14} />
-              {people.length} 位发言人
+              {people.length
+                ? `${people.length} 位发言人`
+                : m.segments.length
+                  ? "未区分说话人"
+                  : "0 位发言人"}
             </button>
             <span className={"badge " + (live ? "recording" : "done")}>
               {status(m)}
@@ -1105,10 +1153,16 @@ function Workspace({
                       setMenu(false);
                       if (
                         confirm(
-                          "重新转写会保留旧原文备份，当前批注仍保留其原句和时间。处理将按录音原速进行，并产生腾讯 API 费用。继续？",
+                          "将创建新的转写版本，保留原文与批注。继续选择语音模型？",
                         )
                       )
-                        void perform(() => api.retranscribe(m.id));
+                        void api
+                          .speechConfig()
+                          .then((c) => {
+                            setTranscriptionChoice(c);
+                            setTranscriptionBinding(c.bindings.meeting);
+                          })
+                          .catch((e) => notify(e.message, true));
                     }}
                   >
                     <RefreshCw size={15} />
@@ -1200,10 +1254,80 @@ function Workspace({
           ))}
         </div>
         <span className="saved-label">
+          {(m.savedAt || m.exportedAt) && (
+            <time dateTime={m.savedAt || m.exportedAt} title="最近保存时间">
+              {new Date((m.savedAt || m.exportedAt)!).toLocaleTimeString(
+                "zh-CN",
+                {
+                  hour: "2-digit",
+                  minute: "2-digit",
+                  second: "2-digit",
+                  hour12: false,
+                },
+              )}
+            </time>
+          )}
           <CheckCheck size={14} />
           已自动保存
         </span>
       </div>
+      {m.speechTask && (
+        <div className="speech-task-status">
+          <span>
+            会后转写 ·{" "}
+            {{
+              preparing: "准备中",
+              uploading: "上传中",
+              queued: "排队中",
+              processing: "处理中",
+              completed: "已完成",
+              failed: "失败",
+              cancelled: "已取消",
+            }[m.speechTask.state] || m.speechTask.state}{" "}
+            {m.speechTask.completed}/{m.speechTask.total}
+          </span>
+          {m.speechTask.error && <span>{m.speechTask.error}</span>}
+          {["failed", "interrupted"].includes(m.speechTask.state) && (
+            <button
+              className="text-button"
+              onClick={() => void perform(() => api.resumeSpeechTask(m.id))}
+            >
+              恢复任务查询
+            </button>
+          )}
+          {["failed", "interrupted"].includes(m.speechTask.state) && (
+            <button
+              className="text-button"
+              onClick={() => void perform(() => api.cancelSpeechTask(m.id))}
+            >
+              取消任务
+            </button>
+          )}
+          {m.pendingTranscript && (
+            <details>
+              <summary>查看新原文</summary>
+              {m.pendingTranscript.segments.map((s) => (
+                <p key={s.id}>{s.text}</p>
+              ))}
+            </details>
+          )}
+          {m.pendingTranscript && (
+            <button
+              className="text-button"
+              onClick={() => {
+                if (
+                  confirm(
+                    "采用新原文？旧原文将保留备份，现有批注保留原句与时间。",
+                  )
+                )
+                  void perform(() => api.applyTranscript(m.id));
+              }}
+            >
+              采用新原文
+            </button>
+          )}
+        </div>
+      )}
       <div className="workspace-body">
         <section className="document-pane">
           {tab === "transcript" ? (
@@ -1280,7 +1404,9 @@ function Workspace({
                             onClick={() => seek(s.startMs)}
                           >
                             <Play size={10} />
-                            {fmt(s.startMs)}
+                            {s.timing === "clip"
+                              ? `片段 ${fmt(s.startMs)}`
+                              : fmt(s.startMs)}
                           </button>
                           {!s.final && (
                             <span className="draft-label">识别中</span>
@@ -1288,13 +1414,22 @@ function Workspace({
                           {s.edited && (
                             <span className="draft-label">已修订</span>
                           )}
-                          <IconButton
-                            className="segment-edit"
-                            title="修改这段原文"
-                            onClick={() => setEdit({ ...s })}
-                          >
-                            <PenLine size={13} />
-                          </IconButton>
+                          <div className="segment-actions">
+                            <IconButton
+                              className="segment-edit"
+                              title="修改这段原文"
+                              onClick={() => setEdit({ ...s })}
+                            >
+                              <PenLine size={13} />
+                            </IconButton>
+                            <IconButton
+                              className="segment-edit danger-text"
+                              title="删除这段原文"
+                              onClick={() => setDeleteBlock(s)}
+                            >
+                              <Trash2 size={13} />
+                            </IconButton>
+                          </div>
                         </div>
                         <p className="segment-text" data-id={s.id}>
                           {highlightText(
@@ -1348,7 +1483,13 @@ function Workspace({
                       <button
                         className="primary"
                         onClick={() =>
-                          void perform(() => api.retranscribe(m.id))
+                          void api
+                            .speechConfig()
+                            .then((c) => {
+                              setTranscriptionChoice(c);
+                              setTranscriptionBinding(c.bindings.meeting);
+                            })
+                            .catch((e) => notify(e.message, true))
                         }
                       >
                         <RefreshCw size={16} />
@@ -1359,13 +1500,23 @@ function Workspace({
                 )}
                 <div ref={bottom} />
               </div>
-              <div className="document-hint">
-                <MessageSquare size={14} />
-                选中一段原文，就能划重点、添加备注。<span>点击时间可回听</span>
-              </div>
             </>
           ) : tab === "summary" ? (
-            <SummaryView m={m} progress={progress} seek={seek} />
+            <div className="summary-with-review">
+              <SummaryView
+                m={m}
+                progress={progress}
+                seek={seek}
+                showStale={
+                  !!m.summaryStale &&
+                  dismissedSummaryRevision !== summaryRevision
+                }
+                onDismissStale={() =>
+                  setDismissedSummaryRevision(summaryRevision)
+                }
+              />
+              <AudioReviewView review={m.summary?.audioReview} seek={seek} />
+            </div>
           ) : (
             <MindmapView summary={m.summary} stale={m.summaryStale} />
           )}
@@ -1378,9 +1529,6 @@ function Workspace({
               <span>{m.annotations.length}</span>
             </div>
           </div>
-          <p className="annotation-intro">
-            你标出的重点，会优先交给 Codex 整理。
-          </p>
           <div className="annotation-list">
             {m.annotations.map((a, i) => (
               <div className="annotation-card" key={a.id}>
@@ -1429,32 +1577,37 @@ function Workspace({
                   <br />
                   把你的想法一起记下来。
                 </p>
-                <div className="selection-demo">
-                  这段讨论很重要<span>＋ 添加备注</span>
-                </div>
               </div>
             )}
           </div>
-          {m.exportedAt && (
-            <button
-              className="obsidian-link"
-              onClick={() => void perform(() => api.openObsidian(m.id))}
-            >
-              <FolderOpen size={16} />
-              <span>
-                已归档到 Obsidian
-                <small>
-                  {new Date(m.exportedAt).toLocaleTimeString("zh-CN", {
-                    hour: "2-digit",
-                    minute: "2-digit",
-                  })}
-                </small>
-              </span>
-              <ExternalLink size={14} />
-            </button>
-          )}
         </aside>
       </div>
+      {transcriptionChoice && (
+        <Modal
+          title="选择转写模型"
+          onClose={() => setTranscriptionChoice(null)}
+        >
+          <SpeechBindingSelect
+            config={transcriptionChoice}
+            value={transcriptionBinding}
+            onChange={setTranscriptionBinding}
+            label="本次转写模型"
+          />
+          <button
+            className="primary"
+            disabled={!transcriptionBinding}
+            onClick={() => {
+              if (transcriptionBinding)
+                void perform(async () => {
+                  await api.retranscribe(m.id, transcriptionBinding);
+                  setTranscriptionChoice(null);
+                });
+            }}
+          >
+            开始转写
+          </button>
+        </Modal>
+      )}
       <footer className="player">
         <div className="player-controls">
           {live ? (
@@ -1478,7 +1631,7 @@ function Workspace({
               {m.status === "transcribing" && (
                 <button
                   className="stop-record"
-                  onClick={() => onControl("stop")}
+                  onClick={() => void perform(() => api.cancelSpeechTask(m.id))}
                 >
                   <Square size={13} />
                   停止转写
@@ -1583,21 +1736,15 @@ function Workspace({
           title={live ? "录音音量" : "点击或拖动定位录音"}
         >
           <div className="wave-bars">
-            {Array.from({ length: 96 }, (_, i) => {
-              const index = Math.floor((i / 96) * m.peaks.length);
-              const peak = live
-                ? m.peaks[Math.max(0, m.peaks.length - 96 + i)]
-                : m.peaks[index];
-              return (
-                <i
-                  key={i}
-                  className={
-                    !live && i / 96 < position / m.durationMs ? "played" : ""
-                  }
-                  style={{ height: Math.max(3, (peak || 0) * 36) }}
-                />
-              );
-            })}
+            {waveformHeights(m.peaks, live).map((height, i) => (
+              <i
+                key={i}
+                className={
+                  !live && i / 96 < position / m.durationMs ? "played" : ""
+                }
+                style={{ height }}
+              />
+            ))}
           </div>
           {!live && m.durationMs > 0 && (
             <input
@@ -1628,11 +1775,13 @@ function Workspace({
                   ? progress || "正在转写"
                   : m.connection?.state === "connected"
                     ? "实时转写已连接"
-                    : m.connection?.state === "offline"
-                      ? "仅本地录音"
-                      : m.connection?.state === "error"
-                        ? "转写连接异常"
-                        : "连接中"}
+                    : m.connection?.state === "after"
+                      ? "会后自动转写"
+                      : m.connection?.state === "offline"
+                        ? "仅本地录音"
+                        : m.connection?.state === "error"
+                          ? "转写连接异常"
+                          : "连接中"}
                 <small>
                   {m.status === "recording"
                     ? `麦克风 ${Math.round(level * 100)}%`
@@ -1794,37 +1943,41 @@ function Workspace({
           </div>
         </Modal>
       )}
-      {showSpeakers && (
-        <Modal title="给发言人一个名字" onClose={() => setShowSpeakers(false)}>
-          <p className="modal-intro">
-            填写姓名后，该发言人的所有原文会一起更新。
-          </p>
-          {people.length ? (
-            people.map((s) => (
-              <SpeakerEditor
-                key={s}
-                m={m}
-                speaker={s}
-                onSave={async (name) => {
-                  const result = await perform(
-                    () => api.renameSpeaker(m.id, s, name),
-                    "姓名已更新",
-                  );
-                  if (result) upsert(result);
-                }}
-              />
-            ))
-          ) : (
-            <div className="info-panel">
-              开始转写后，会自动出现 A、B、C 等发言人。
-            </div>
-          )}
+      {deleteBlock && (
+        <Modal title="删除这段原文" onClose={() => setDeleteBlock(null)}>
+          <p className="modal-intro">同时删除关联批注，原始录音保留。</p>
           <div className="modal-actions">
-            <button className="primary" onClick={() => setShowSpeakers(false)}>
-              完成
+            <button className="secondary" onClick={() => setDeleteBlock(null)}>
+              取消
+            </button>
+            <button
+              className="secondary danger-text"
+              onClick={() =>
+                void perform(async () => {
+                  upsert(await api.deleteSegment(m.id, deleteBlock.id));
+                  setSelection(null);
+                  setDeleteBlock(null);
+                })
+              }
+            >
+              删除
             </button>
           </div>
         </Modal>
+      )}
+      {showSpeakers && (
+        <SpeakersDialog
+          m={m}
+          onClose={() => setShowSpeakers(false)}
+          onSave={async (changes) => {
+            const result = await perform(() => api.editSpeakers(m.id, changes));
+            if (!result) return false;
+            upsert(result);
+            setSelection(null);
+            setShowSpeakers(false);
+            return true;
+          }}
+        />
       )}
       {rename && (
         <Modal title="修改会议标题" onClose={() => setRename(false)}>
@@ -1883,45 +2036,118 @@ function highlightText(text: string, annotations: Annotation[], query: string) {
   parts.push(text.slice(pos));
   return parts;
 }
-function SpeakerEditor({
+function SpeakersDialog({
   m,
-  speaker,
+  onClose,
   onSave,
 }: {
   m: Meeting;
-  speaker: string;
-  onSave: (s: string) => void;
+  onClose: () => void;
+  onSave: (
+    changes: { id: string; name: string; deleted: boolean }[],
+  ) => Promise<boolean>;
 }) {
-  const [name, setName] = useState(m.speakers[speaker] || "");
+  const [rows, setRows] = useState(() =>
+    Array.from(
+      new Set([
+        ...m.segments.map((s) => s.speaker),
+        ...Object.keys(m.speakers),
+      ]),
+    )
+      .filter((id) => id !== "-1")
+      .map((id) => ({ id, name: m.speakers[id] || "", deleted: false })),
+  );
+  const [saving, setSaving] = useState(false);
+  const pending = rows.filter((r) => r.deleted).length;
   return (
-    <div className="speaker-editor">
-      <span
-        className="speaker-avatar"
-        style={{ color: color(speaker), background: color(speaker) + "20" }}
-      >
-        {String.fromCharCode(65 + Number(speaker))}
-      </span>
-      <label className="field">
-        说话人 {String.fromCharCode(65 + Number(speaker))}
-        <input
-          placeholder="填写姓名"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-        />
-      </label>
-      <button className="secondary" onClick={() => onSave(name)}>
-        <Check size={15} />
-        保存
-      </button>
-    </div>
+    <Modal
+      title="编辑发言人"
+      onClose={() => {
+        if (!saving) onClose();
+      }}
+    >
+      <div className="speaker-editor-list">
+        {rows
+          .filter((r) => !r.deleted)
+          .map((row) => (
+            <div className="speaker-editor" key={row.id}>
+              <span
+                className="speaker-avatar"
+                style={{
+                  color: color(row.id),
+                  background: color(row.id) + "20",
+                }}
+              >
+                {label(m, row.id).replace("说话人 ", "").slice(0, 1)}
+              </span>
+              <label className="field">
+                {label(m, row.id)}
+                <input
+                  placeholder="填写姓名"
+                  value={row.name}
+                  disabled={saving}
+                  onChange={(e) =>
+                    setRows(
+                      rows.map((r) =>
+                        r.id === row.id ? { ...r, name: e.target.value } : r,
+                      ),
+                    )
+                  }
+                />
+              </label>
+              <button
+                className="secondary danger-text"
+                disabled={saving}
+                aria-label={`删除${label(m, row.id)}`}
+                onClick={() =>
+                  setRows(
+                    rows.map((r) =>
+                      r.id === row.id ? { ...r, deleted: true } : r,
+                    ),
+                  )
+                }
+              >
+                <Trash2 size={15} />
+                删除
+              </button>
+            </div>
+          ))}
+        {!rows.length && <p className="modal-intro">暂无发言人</p>}
+      </div>
+      {!!pending && (
+        <p className="modal-intro">
+          完成后将删除 {pending} 位发言人及其发言块、关联批注。
+        </p>
+      )}
+      <div className="modal-actions">
+        <button
+          className="primary"
+          disabled={saving}
+          onClick={async () => {
+            setSaving(true);
+            try {
+              await onSave(rows);
+            } finally {
+              setSaving(false);
+            }
+          }}
+        >
+          {saving ? "保存中…" : "完成"}
+        </button>
+      </div>
+    </Modal>
   );
 }
 function SummaryView({
   m,
   progress,
   seek,
+  showStale,
+  onDismissStale,
 }: {
   m: Meeting;
+  showStale: boolean;
+  onDismissStale: () => void;
   progress?: string;
   seek: (n: number) => void;
 }) {
@@ -1957,10 +2183,13 @@ function SummaryView({
           {m.summaryError}
         </div>
       )}
-      {m.summaryStale && (
-        <div className="info-panel">
+      {showStale && (
+        <div className="info-panel summary-notice" role="status">
           <RefreshCw size={16} />
-          原文或批注已更新，可以点击“重新整理”更新纪要。
+          <span>原文或批注已更新，可重新整理纪要。</span>
+          <IconButton title="关闭更新提示" onClick={onDismissStale}>
+            <X size={16} />
+          </IconButton>
         </div>
       )}
       {s ? (
@@ -1983,7 +2212,7 @@ function SummaryView({
               <div>
                 <h4>{t.title}</h4>
                 <p>{t.detail}</p>
-                <div>{refs(t.sourceIds)}</div>
+                <div className="source-links">{refs(t.sourceIds)}</div>
               </div>
             </div>
           ))}
@@ -1994,7 +2223,7 @@ function SummaryView({
                 <CheckCircle2 size={17} />
                 <div>
                   {d.text}
-                  <div>{refs(d.sourceIds)}</div>
+                  <div className="source-links">{refs(d.sourceIds)}</div>
                 </div>
               </div>
             ))
@@ -2011,7 +2240,7 @@ function SummaryView({
                   <small>
                     {a.owner || "负责人待确认"} · {a.deadline || "期限待确认"}
                   </small>
-                  {refs(a.sourceIds)}
+                  <div className="source-links">{refs(a.sourceIds)}</div>
                 </div>
               </div>
             ))
@@ -2146,14 +2375,34 @@ function SettingsPanel({
   onClose: () => void;
   notify: (s: string, e?: boolean) => void;
 }) {
-  const [s, setS] = useState<Settings>({ ...settings }),
-    [tab, setTab] = useState("tencent"),
+  const autosave = useSettingsAutosave(settings, onSaved);
+  const { draft: s, setDraft: setS, flush } = autosave;
+  const [tab, setTab] = useState("tencent"),
     [busy, setBusy] = useState(false),
     [devices, setDevices] = useState<MediaDeviceInfo[]>([]),
     [health, setHealth] = useState<any>(null),
     [test, setTest] = useState("");
-  const change = (key: keyof Settings, value: any) =>
-    setS((c) => ({ ...c, [key]: value }));
+  const change = (key: keyof Settings, value: any, immediate = false) => {
+    const blurFields = [
+      "dataRoot",
+      "vaultPath",
+      "vaultFolder",
+      "codexPath",
+      "ffmpegPath",
+      "secretId",
+      "secretKey",
+      "apiKey",
+    ];
+    void autosave
+      .change(key, value, immediate ? 0 : blurFields.includes(key) ? null : 500)
+      .catch(() => {});
+  };
+  const closeRef = useRef<() => void>(() => {});
+  closeRef.current = () => {
+    void flush()
+      .then(onClose)
+      .catch((e) => notify(e.message, true));
+  };
   const enumerate = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -2176,45 +2425,19 @@ function SettingsPanel({
       .enumerateDevices()
       .then((ds) => setDevices(ds.filter((d) => d.kind === "audioinput")));
   }, []);
-  const save = async () => {
-    setBusy(true);
-    try {
-      const next = await api.saveSettings(s);
-      setS(next);
-      onSaved(next);
-      notify("设置已保存");
-      return next;
-    } catch (e) {
-      notify((e as Error).message, true);
-    } finally {
-      setBusy(false);
-    }
-  };
-  const testCloud = async () => {
-    setBusy(true);
-    setTest("正在保存配置并测试连接…");
-    try {
-      const saved = await api.saveSettings(s);
-      onSaved(saved);
-      setS(saved);
-      if (!saved.appId) {
-        const resolved = await api.resolveAppId();
-        onSaved(resolved);
-        setS(resolved);
-      }
-      setTest(await api.testTencent());
-    } catch (e) {
-      setTest((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  };
   return (
-    <Modal title="设置与连接" wide onClose={onClose}>
-      <div className="settings-layout">
+    <Modal title="设置与连接" wide onClose={() => closeRef.current()}>
+      <div
+        className="settings-layout"
+        onBlur={() => {
+          void flush().catch(() => {});
+        }}
+      >
         <nav className="settings-nav">
           {[
-            { id: "tencent", label: "语音识别", icon: AudioLines },
+            { id: "tencent", label: "语音供应商", icon: AudioLines },
+            { id: "transcription", label: "会议转写", icon: FileText },
+            { id: "review", label: "录音复核", icon: Headphones },
             { id: "recording", label: "录音设备", icon: Mic },
             { id: "shortcuts", label: "快捷键", icon: Keyboard },
             { id: "summary", label: "AI 整理", icon: Sparkles },
@@ -2230,168 +2453,16 @@ function SettingsPanel({
               {n.label}
             </button>
           ))}
-          <div className="settings-security">
-            <ShieldCheck size={23} />
-            <p>密钥加密保存在这台 Mac，界面和导出文件不包含密钥。</p>
-          </div>
         </nav>
         <div className="settings-content">
           {tab === "tencent" && (
-            <>
-              <div className="settings-section-title">
-                <div className="settings-title-icon">
-                  <AudioLines size={21} />
-                </div>
-                <div>
-                  <h3>腾讯云实时语音识别</h3>
-                  <p>中文转写 · 实时说话人分离</p>
-                </div>
-              </div>
-              <div className="model-chip">
-                16k_zh_en_speaker_2.0<span>固定识别引擎</span>
-              </div>
-              <label className="field">
-                AppID
-                <div className="input-with-button">
-                  <input
-                    value={s.appId}
-                    placeholder="腾讯云数字 AppID"
-                    onChange={(e) => change("appId", e.target.value)}
-                  />
-                  <button
-                    className="secondary"
-                    disabled={busy}
-                    onClick={async () => {
-                      setBusy(true);
-                      try {
-                        await api.saveSettings(s);
-                        const next = await api.resolveAppId();
-                        setS(next);
-                        onSaved(next);
-                        notify("AppID 已自动获取");
-                      } catch (e) {
-                        notify((e as Error).message, true);
-                      } finally {
-                        setBusy(false);
-                      }
-                    }}
-                  >
-                    自动获取
-                  </button>
-                </div>
-              </label>
-              <div className="settings-fields">
-                <label className="field">
-                  SecretId{" "}
-                  {s.secretIdConfigured && (
-                    <span className="configured">
-                      <Check size={12} />
-                      已配置
-                    </span>
-                  )}
-                  <input
-                    type="password"
-                    autoComplete="off"
-                    placeholder={
-                      s.secretIdConfigured
-                        ? "留空保持现有密钥"
-                        : "填写 SecretId"
-                    }
-                    value={s.secretId ?? ""}
-                    onChange={(e) => {
-                      if (e.target.value) change("secretId", e.target.value);
-                      else
-                        setS((c) => {
-                          const n = { ...c };
-                          delete n.secretId;
-                          return n;
-                        });
-                    }}
-                  />
-                </label>
-                <label className="field">
-                  SecretKey{" "}
-                  {s.secretKeyConfigured && (
-                    <span className="configured">
-                      <Check size={12} />
-                      已配置
-                    </span>
-                  )}
-                  <input
-                    type="password"
-                    autoComplete="off"
-                    placeholder={
-                      s.secretKeyConfigured
-                        ? "留空保持现有密钥"
-                        : "填写 SecretKey"
-                    }
-                    value={s.secretKey ?? ""}
-                    onChange={(e) => {
-                      if (e.target.value) change("secretKey", e.target.value);
-                      else
-                        setS((c) => {
-                          const n = { ...c };
-                          delete n.secretKey;
-                          return n;
-                        });
-                    }}
-                  />
-                </label>
-              </div>
-              <label className="field">
-                识别热词
-                <textarea
-                  rows={3}
-                  value={s.hotwords}
-                  onChange={(e) => change("hotwords", e.target.value)}
-                  placeholder="项目名称、人名、专业术语，用逗号或换行分隔"
-                />
-              </label>
-              <p className="field-help">
-                把会议中常见的专有名词放在这里，帮助减少同音字识别错误。
-              </p>
-              <div className="settings-test-row">
-                <button
-                  className="secondary"
-                  disabled={busy}
-                  onClick={testCloud}
-                >
-                  {busy ? (
-                    <Loader2 size={15} className="spin" />
-                  ) : (
-                    <Radio size={15} />
-                  )}
-                  保存并测试连接
-                </button>
-                <button
-                  className="text-button danger-text"
-                  onClick={() => {
-                    change("secretId", "");
-                    change("secretKey", "");
-                    setS((c) => ({
-                      ...c,
-                      secretId: "",
-                      secretKey: "",
-                      secretIdConfigured: false,
-                      secretKeyConfigured: false,
-                    }));
-                  }}
-                >
-                  清除腾讯密钥
-                </button>
-              </div>
-              {test && (
-                <div
-                  className={
-                    "connection-result " +
-                    (test.includes("成功") ? "success" : "")
-                  }
-                >
-                  <AlertCircle size={16} />
-                  {test}
-                </div>
-              )}
-            </>
+            <SpeechSettings onError={(e) => notify(e, true)} />
+          )}
+          {tab === "transcription" && (
+            <SpeechSettings mode="meeting" onError={(e) => notify(e, true)} />
+          )}
+          {tab === "review" && (
+            <SpeechSettings mode="review" onError={(e) => notify(e, true)} />
           )}
           {tab === "recording" && (
             <>
@@ -2408,7 +2479,7 @@ function SettingsPanel({
                 默认麦克风
                 <select
                   value={s.micId}
-                  onChange={(e) => change("micId", e.target.value)}
+                  onChange={(e) => change("micId", e.target.value, true)}
                 >
                   <option value="">跟随系统默认设备</option>
                   {devices
@@ -2458,7 +2529,7 @@ function SettingsPanel({
               <div className="provider-options">
                 <button
                   className={s.summaryProvider === "codex" ? "selected" : ""}
-                  onClick={() => change("summaryProvider", "codex")}
+                  onClick={() => change("summaryProvider", "codex", true)}
                 >
                   <Command size={22} />
                   <strong>Codex</strong>
@@ -2467,7 +2538,7 @@ function SettingsPanel({
                 </button>
                 <button
                   className={s.summaryProvider === "api" ? "selected" : ""}
-                  onClick={() => change("summaryProvider", "api")}
+                  onClick={() => change("summaryProvider", "api", true)}
                 >
                   <KeyRound size={22} />
                   <strong>自有 API</strong>
@@ -2488,23 +2559,25 @@ function SettingsPanel({
                         className="secondary"
                         onClick={async () => {
                           const p = await api.chooseCodex();
-                          if (p) change("codexPath", p);
+                          if (p) change("codexPath", p, true);
                         }}
                       >
                         选择
                       </button>
                     </div>
                   </label>
-                  <div className="connection-result success">
-                    <CheckCircle2 size={16} />
-                    {health?.codexInstalled
-                      ? "已检测到 Codex CLI"
-                      : "尚未找到 Codex CLI"}
-                  </div>
-                  <p className="field-help">
-                    使用 Codex
-                    已有登录状态。点击“生成纪要”后启动一次整理任务；资料中的发言只作为数据，原始记录不会被覆盖。
-                  </p>
+                  <CodexModelPicker
+                    path={settings.codexPath}
+                    model={s.codexModel}
+                    effort={s.codexReasoningEffort}
+                    onModel={(model, effort) => {
+                      change("codexModel", model, true);
+                      change("codexReasoningEffort", effort, true);
+                    }}
+                    onEffort={(effort) =>
+                      change("codexReasoningEffort", effort, true)
+                    }
+                  />
                 </>
               ) : (
                 <>
@@ -2535,24 +2608,13 @@ function SettingsPanel({
                       placeholder="填写或替换密钥"
                       onChange={(e) => {
                         if (e.target.value) change("apiKey", e.target.value);
-                        else
-                          setS((c) => {
-                            const n = { ...c };
-                            delete n.apiKey;
-                            return n;
-                          });
+                        else autosave.cancel("apiKey");
                       }}
                     />
                   </label>
                   <button
                     className="text-button danger-text"
-                    onClick={() =>
-                      setS((c) => ({
-                        ...c,
-                        apiKey: "",
-                        apiKeyConfigured: false,
-                      }))
-                    }
+                    onClick={() => change("apiKey", "", true)}
                   >
                     清除 API 密钥
                   </button>
@@ -2589,7 +2651,7 @@ function SettingsPanel({
                     className="secondary"
                     onClick={async () => {
                       const p = await api.chooseDataRoot();
-                      if (p) change("dataRoot", p);
+                      if (p) change("dataRoot", p, true);
                     }}
                   >
                     选择
@@ -2611,7 +2673,7 @@ function SettingsPanel({
                     className="secondary"
                     onClick={async () => {
                       const p = await api.chooseVault();
-                      if (p) change("vaultPath", p);
+                      if (p) change("vaultPath", p, true);
                     }}
                   >
                     <FolderOpen size={15} />
@@ -2685,14 +2747,15 @@ function SettingsPanel({
               ].map((item) => (
                 <label className="field" key={item.key}>
                   {item.label}
-                  <input
-                    aria-label={item.label + "快捷键"}
+                  <ShortcutRecorder
+                    label={item.label + "快捷键"}
                     value={s.shortcuts[item.key]}
-                    onChange={(e) =>
-                      change("shortcuts", {
-                        ...s.shortcuts,
-                        [item.key]: e.target.value,
-                      })
+                    onChange={(value) =>
+                      autosave.change(
+                        "shortcuts",
+                        { ...s.shortcuts, [item.key]: value },
+                        0,
+                      )
                     }
                   />
                   <span className="shortcut-help">{item.help}</span>
@@ -2701,8 +2764,8 @@ function SettingsPanel({
               <div className="info-panel">
                 <Keyboard size={17} />
                 <span>
-                  使用 CommandOrControl、Shift、Alt 与字母组合，例如
-                  CommandOrControl+Shift+R。留空禁用。保存时检查冲突，结束录制始终需要确认。
+                  点击输入框，直接按下组合键即可自动保存。Esc 取消，Delete
+                  清除。录入时暂停全局快捷键；重复或被占用的组合不会覆盖原设置。结束录制始终需要确认。
                 </span>
               </div>
             </>
@@ -2727,7 +2790,7 @@ function SettingsPanel({
                   <button
                     className={s.theme === t.id ? "selected" : ""}
                     key={t.id}
-                    onClick={() => change("theme", t.id)}
+                    onClick={() => change("theme", t.id, true)}
                   >
                     <div className={"theme-preview " + t.id}>
                       <span />
@@ -2744,16 +2807,14 @@ function SettingsPanel({
           )}
         </div>
       </div>
-      <div className="settings-footer">
-        <span>
-          <ShieldCheck size={14} />
-          更改后点击保存，密钥只在本机加密存储
-        </span>
-        <button className="primary" disabled={busy} onClick={save}>
-          {busy ? <Loader2 size={16} className="spin" /> : <Check size={16} />}
-          保存设置
-        </button>
-      </div>
+      {autosave.error && (
+        <div className="settings-footer autosave-footer">
+          <span className="danger-text" role="alert">
+            <AlertCircle size={14} />
+            {autosave.status}
+          </span>
+        </div>
+      )}
     </Modal>
   );
 }

@@ -18,3 +18,5 @@ meetings/
 *.m4a
 summary-response.json
 summary-schema.json
+
+!resources/connection-test.wav

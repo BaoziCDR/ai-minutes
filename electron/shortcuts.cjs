@@ -20,7 +20,14 @@ function validate(shortcuts) {
     )
       throw Error("快捷键需要组合键，例如 CommandOrControl+Shift+R");
     const id = normalize(value)
-      .replace(/CommandOrControl|Command/g, "Control")
+      .replace(
+        /CommandOrControl/g,
+        process.platform === "darwin" ? "Command" : "Control",
+      )
+      .replace(/Option/g, "Alt")
+      .split("+")
+      .sort()
+      .join("+")
       .toLowerCase();
     if (used.has(id)) throw Error("快捷键不能重复。");
     used.add(id);

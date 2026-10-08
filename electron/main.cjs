@@ -1,3 +1,10 @@
+const transcriptEdit = require("./transcript-edit.cjs");
+const { SpeechRegistry } = require("./speech/registry.cjs");
+const { SpeechRuntime, Queue } = require("./speech/runtime.cjs");
+const { SpeechTasks } = require("./speech/tasks.cjs");
+const { reviewSummary, reviewMarkdown } = require("./review.cjs");
+let speechRegistry, speechRuntime, speechTasks;
+const { findCodex, listModels } = require("./codex-models.cjs");
 const {
   app,
   BrowserWindow,
@@ -26,7 +33,7 @@ const {
   transcript,
   notes,
 } = require("./store.cjs");
-const { TencentStream, getAppId } = require("./tencent.cjs");
+const { getAppId } = require("./tencent.cjs");
 const { generate, mermaid, summaryMarkdown } = require("./summary.cjs");
 const { validateRoot, copyMeetings } = require("./storage.cjs");
 const { syncMeeting, syncIndex } = require("./obsidian.cjs");
@@ -62,7 +69,9 @@ const defaults = {
   micId: "",
   vaultPath: path.join(os.homedir(), "basic-memory"),
   vaultFolder: "会议记录",
-  codexPath: "/opt/homebrew/bin/codex",
+  codexPath: findCodex(),
+  codexModel: "",
+  codexReasoningEffort: "medium",
   ffmpegPath: "/opt/homebrew/bin/ffmpeg",
   summaryProvider: "codex",
   apiBase: "https://api.openai.com/v1",
@@ -97,6 +106,11 @@ function loadSettings() {
     shortcuts: { ...shortcutsModule.defaults, ...c.shortcuts },
     autoExport: true,
   };
+  if (
+    settings.codexPath === "/opt/homebrew/bin/codex" &&
+    !fs.existsSync(settings.codexPath)
+  )
+    settings.codexPath = findCodex();
   settings.dataRoot =
     c.dataRoot ||
     (process.env.AI_MINUTES_DATA_DIR
@@ -119,13 +133,18 @@ function loadSettings() {
     );
   persistSettings();
 }
+let shortcutCapture = false;
 function registerShortcuts(values = settings.shortcuts) {
-  shortcutsModule.install(globalShortcut, values, (action) => {
-    if (win && !win.isDestroyed()) {
-      win.show();
-      emit({ type: "shortcut", action });
-    }
-  });
+  try {
+    shortcutsModule.install(globalShortcut, values, (action) => {
+      if (win && !win.isDestroyed()) {
+        win.show();
+        emit({ type: "shortcut", action });
+      }
+    });
+  } finally {
+    if (shortcutCapture) globalShortcut.unregisterAll();
+  }
 }
 function syncNow(m) {
   try {
@@ -166,11 +185,33 @@ async function updateSettings(patch) {
   for (const k of [...Object.keys(defaults), ...secretFields])
     if (k in patch) next[k] = patch[k];
   next.autoExport = true;
-  if (next.appId && !/^\d{5,15}$/.test(next.appId))
+  if (
+    typeof next.codexModel !== "string" ||
+    !/^[a-zA-Z0-9._:/-]*$/.test(next.codexModel)
+  )
+    throw Error("Codex 模型名称无效。");
+  if (
+    ![
+      "none",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+      "ultra",
+    ].includes(next.codexReasoningEffort)
+  )
+    throw Error("推理程度无效。");
+  if ("appId" in patch && next.appId && !/^\d{5,15}$/.test(next.appId))
     throw Error("AppID 应为数字。");
-  next.dataRoot = validateRoot(next.dataRoot, app.getAppPath());
+  if ("dataRoot" in patch)
+    next.dataRoot = validateRoot(next.dataRoot, app.getAppPath());
   shortcutsModule.validate(next.shortcuts);
-  if (!path.isAbsolute(next.vaultPath) || !fs.existsSync(next.vaultPath))
+  if (
+    "vaultPath" in patch &&
+    (!path.isAbsolute(next.vaultPath) || !fs.existsSync(next.vaultPath))
+  )
     throw Error("Obsidian 库路径不存在。");
   if (
     path.isAbsolute(next.vaultFolder) ||
@@ -178,10 +219,10 @@ async function updateSettings(patch) {
   )
     throw Error("会议目录必须位于 Obsidian 库内。");
   const rootChanged = next.dataRoot !== settings.dataRoot;
-  if (rootChanged && (recording || jobs.size))
+  if (rootChanged && (recording || jobs.size || speechTasks?.running.size))
     throw Error("请结束录制和 AI 整理后，再切换保存根目录。");
   try {
-    registerShortcuts(next.shortcuts);
+    if ("shortcuts" in patch) registerShortcuts(next.shortcuts);
     if (rootChanged) {
       migrating = true;
       for (const timer of syncTimers.values()) clearTimeout(timer);
@@ -191,17 +232,28 @@ async function updateSettings(patch) {
     }
     settings = next;
     persistSettings();
-    if (rootChanged) store = new Store(path.join(next.dataRoot, "meetings"));
+    if (rootChanged) {
+      store = new Store(path.join(next.dataRoot, "meetings"));
+      if (speechTasks) {
+        speechTasks.store = store;
+        speechTasks.recover();
+      }
+    }
   } catch (e) {
     settings = previous;
     try {
-      registerShortcuts();
+      if ("shortcuts" in patch) registerShortcuts();
     } catch {}
     throw e;
   } finally {
     migrating = false;
   }
-  for (const m of store.list()) scheduleSync(m);
+  if (
+    rootChanged ||
+    next.vaultPath !== previous.vaultPath ||
+    next.vaultFolder !== previous.vaultFolder
+  )
+    for (const m of store.list()) scheduleSync(m);
   return publicSettings();
 }
 function persistSettings() {
@@ -215,6 +267,8 @@ function persistSettings() {
     c[k] = settings[k]
       ? safeStorage.encryptString(settings[k]).toString("base64")
       : "";
+  if (speechRegistry)
+    for (const k of ["appId", "hotwords", "secretId", "secretKey"]) delete c[k];
   atomic(configPath(), c);
 }
 function publicSettings() {
@@ -237,11 +291,7 @@ function save(m, debounce = false) {
   if (!debounce) publish(m);
   return m;
 }
-function credentials() {
-  if (!settings.appId || !settings.secretId || !settings.secretKey)
-    throw Error("请先在设置中填写腾讯 AppID、SecretId 和 SecretKey。");
-  return { ...settings };
-}
+
 function run(bin, args) {
   return new Promise((resolve, reject) => {
     const p = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
@@ -262,61 +312,70 @@ function syncHeader(rec) {
   fs.fsyncSync(rec.fd);
 }
 function createCloud(rec) {
-  const cloud = (rec.cloud = new TencentStream(credentials()));
-  cloud.contextId = rec.contextId || "";
-  const take = crypto.randomUUID().slice(0, 8);
-  rec.connectOffset =
-    rec.queue[0]?.offset ??
-    (rec.retranscribing ? rec.replayOffset || 0 : rec.m.durationMs);
-  cloud.on("status", (s) => {
-    rec.m.connection = s;
-    publish(rec.m);
-  });
-  cloud.on("issue", (e) => {
-    rec.offline = true;
-    if (rec.queue.length) {
+  const input = (rec.input = new Queue(150));
+  const controller = (rec.controller = new AbortController());
+  rec.cloudTask = (async () => {
+    try {
+      for await (const e of speechRuntime.run(
+        {
+          resolved: rec.resolved,
+          input,
+          purpose: "transcribe",
+          startMs: rec.m.durationMs,
+          contextId: rec.contextId,
+        },
+        controller.signal,
+      )) {
+        if (e.type === "status") {
+          rec.m.connection = { state: e.state, message: e.message || "" };
+          publish(rec.m);
+        }
+        if (e.type === "segments") {
+          for (const segment of e.segments) {
+            if (
+              rec.m.deletedSegmentIds?.includes(segment.id) ||
+              rec.m.deletedSpeakerIds?.includes(segment.speaker)
+            )
+              continue;
+            const old = rec.m.segments.find((s) => s.id === segment.id);
+            if (old) {
+              if (!old.edited) old.text = segment.text;
+              if (!old.speakerEdited) old.speaker = segment.speaker;
+              old.endMs = segment.endMs;
+              old.final = segment.final;
+            } else if (segment.text.trim()) rec.m.segments.push(segment);
+          }
+          rec.m.segments.sort((a, b) => a.startMs - b.startMs);
+          save(rec.m, true);
+          publish(rec.m);
+        }
+        if (e.type === "completed") {
+          rec.contextId = e.contextId || rec.contextId;
+          rec.m.speakerContextId = rec.contextId;
+        }
+      }
+    } catch (e) {
+      if (controller.signal.aborted) return;
+      rec.offline = true;
+      rec.m.connection = { state: "error", message: e.message };
+      rec.m.lastError = e.message;
       rec.m.gaps.push({
-        startMs: rec.queue[0].offset,
+        startMs: rec.m.durationMs,
         endMs: rec.m.durationMs,
-        reason: e.message,
+        reason: "转写连接中断，本地录音继续保存",
       });
-      rec.queue = [];
+      save(rec.m);
     }
-    rec.m.connection = { state: "error", message: e.message };
-    rec.m.lastError = e.message;
-    save(rec.m);
-  });
-  cloud.on("segments", (segments) => {
-    const m = rec.m;
-    for (const s of segments) {
-      s.id = take + "-" + s.id;
-      const old = m.segments.find((x) => x.id === s.id);
-      if (old) {
-        if (!old.edited) old.text = s.text;
-        if (!old.speakerEdited) old.speaker = s.speaker;
-        old.endMs = s.endMs;
-        old.final = s.final;
-      } else if (s.text.trim()) m.segments.push(s);
-    }
-    m.segments.sort((a, b) => a.startMs - b.startMs);
-    save(m, true);
-    publish(m);
-  });
-  cloud.on("disconnected", () => {
-    rec.contextId = cloud.contextId || rec.contextId;
-    if (recording !== rec || rec.paused || rec.ending) return;
-    clearTimeout(rec.reconnectTimer);
-    rec.reconnectTimer = setTimeout(() => {
-      if (recording === rec && !rec.paused && !rec.ending) createCloud(rec);
-    }, 1500);
-  });
-  cloud.connect(rec.connectOffset);
+  })();
 }
+
 async function begin(id, offline = false) {
   if (recording) throw Error("请先结束当前录制。");
-  if (!offline) credentials();
+  const binding = speechRegistry.public().bindings.meeting;
+  const resolved = offline ? null : speechRegistry.resolve(binding);
   const m = store.get(id);
-  if (jobs.has(id)) throw Error("请等待整理完成。");
+  if (jobs.has(id) || speechTasks.running.has(id))
+    throw Error("请等待当前处理完成。");
   const file = path.join(store.dir(id), "recording.wav");
   const exists = fs.existsSync(file);
   const fd = fs.openSync(file, exists ? "r+" : "w+");
@@ -332,28 +391,29 @@ async function begin(id, offline = false) {
     queue: [],
     paused: false,
     ending: false,
-    offline,
+    offline: offline || binding?.mode === "after",
+    after: !offline && binding?.mode === "after",
+    binding,
+    resolved,
     contextId: m.speakerContextId || "",
   });
   save(m);
-  if (!offline) createCloud(rec);
-  else m.connection = { state: "offline", message: "仅录音，稍后可重新转写" };
-  rec.interval = setInterval(() => {
-    if (rec.cloud?.ready && rec.queue.length) {
-      const item = rec.queue.shift();
-      if (!rec.cloud.send(item.buf)) rec.queue.unshift(item);
-    }
-    if (!rec.offline && rec.queue.length > 150) {
-      const drop = rec.queue.splice(0, rec.queue.length - 50);
-      m.gaps.push({
-        startMs: drop[0].offset,
-        endMs: drop.at(-1).offset + drop.at(-1).buf.length / 32,
-        reason: "网络中断，原始录音已保存，可重新转写",
-      });
-      rec.cloud.close();
-      createCloud(rec);
-    }
-  }, 200);
+  if (!rec.offline) createCloud(rec);
+  else
+    m.connection = {
+      state: rec.after ? "after" : "offline",
+      message: rec.after ? "会后自动转写" : "仅录音",
+    };
+  m.transcriptionSource = resolved
+    ? {
+        connectionId: binding.connectionId,
+        profileId: binding.profileId,
+        provider: resolved.connection.name,
+        model: resolved.profile.model,
+        kind: resolved.profile.kind,
+        revision: resolved.revision,
+      }
+    : null;
   rec.checkpoint = setInterval(() => {
     syncHeader(rec);
     save(m, true);
@@ -375,30 +435,33 @@ function append(data) {
   for (let i = 0; i < b.length; i += 2)
     peak = Math.max(peak, Math.abs(b.readInt16LE(i)) / 32768);
   rec.m.peaks.push(peak);
-  if (!rec.offline) rec.queue.push({ buf: b, offset });
+  if (!rec.offline) {
+    const dropped = rec.input?.push({ buf: b, offset });
+    if (dropped)
+      rec.m.gaps.push({
+        startMs: dropped.offset,
+        endMs: dropped.offset + dropped.buf.length / 32,
+        reason: "转写积压，原始录音已保存",
+      });
+  }
 }
 async function finishCloud(rec) {
-  const until = Date.now() + 12000;
-  while (rec.queue.length && rec.cloud?.ready && Date.now() < until)
-    await new Promise((r) => setTimeout(r, 200));
-  if (rec.queue.length) {
-    rec.m.gaps.push({
-      startMs: rec.queue[0].offset,
-      endMs: rec.m.durationMs,
-      reason: "部分音频未完成在线识别，可用录音重新转写",
-    });
-    rec.queue = [];
-  }
-  if (rec.cloud) {
-    await new Promise((resolve) => {
-      rec.cloud.once("finished", resolve);
-      rec.cloud.finish();
-      setTimeout(resolve, 4000);
-    });
-    rec.contextId = rec.cloud.contextId || rec.contextId;
-    rec.m.speakerContextId = rec.contextId;
-  }
+  if (!rec.input) return;
+  rec.input.end();
+  let timer;
+  await Promise.race([
+    rec.cloudTask,
+    new Promise((resolve) => {
+      timer = setTimeout(() => {
+        rec.controller?.abort();
+        resolve();
+      }, 15000);
+    }),
+  ]);
+  clearTimeout(timer);
+  rec.input = null;
 }
+
 async function pause() {
   const rec = recording;
   if (!rec || rec.paused) return;
@@ -422,18 +485,6 @@ async function resume() {
 async function stop() {
   const rec = recording;
   if (!rec) return null;
-  if (rec.retranscribing) {
-    rec.ending = true;
-    clearInterval(rec.interval);
-    clearTimeout(rec.reconnectTimer);
-    rec.cloud?.close();
-    if (rec.readFd !== undefined) fs.closeSync(rec.readFd);
-    rec.m.status = "completed";
-    rec.m.connection = null;
-    recording = null;
-    save(rec.m);
-    return rec.m;
-  }
   rec.ending = true;
   clearTimeout(rec.reconnectTimer);
   await finishCloud(rec);
@@ -447,6 +498,16 @@ async function stop() {
   recording = null;
   if (powerId !== undefined && powerSaveBlocker.isStarted(powerId))
     powerSaveBlocker.stop(powerId);
+  if (rec.after) {
+    try {
+      await speechTasks.start(rec.m.id, rec.binding, {
+        resolved: rec.resolved,
+      });
+    } catch (e) {
+      rec.m.lastError = e.message;
+      save(rec.m);
+    }
+  }
   return rec.m;
 }
 function exportMeeting(m, dest) {
@@ -490,7 +551,8 @@ function exportObsidian(m) {
   return dest;
 }
 async function startSummary(id) {
-  if (jobs.has(id)) throw Error("这场会议正在整理。");
+  if (jobs.has(id) || speechTasks.running.has(id))
+    throw Error("这场会议正在处理。");
   const m = store.get(id);
   if (!m.segments.length)
     throw Error("还没有转写原文，请录制或重新转写音频后再整理。");
@@ -503,16 +565,29 @@ async function startSummary(id) {
     m.annotations,
     m.speakers,
   ]);
-  const task = generate(
+  const task = reviewSummary(
     structuredClone(m),
-    settings,
+    structuredClone(settings),
     store.dir(id),
+    speechRegistry,
+    speechRuntime,
     (message) => emit({ type: "summaryProgress", id, message }),
   );
   jobs.set(id, task);
   task.promise
-    .then((result) => {
+    .then(async (result) => {
       const current = store.get(id);
+      let audioChanged = false;
+      if (result.audioReview?.audioHash)
+        try {
+          audioChanged =
+            result.audioReview.audioHash !==
+            (await require("./speech/audio.cjs").hashFile(
+              path.join(store.dir(id), "recording.wav"),
+            ));
+        } catch {
+          audioChanged = true;
+        }
       const valid = new Set(current.segments.map((s) => s.id));
       for (const t of [
         ...result.topics,
@@ -524,12 +599,13 @@ async function startSummary(id) {
       current.summaryStatus = "completed";
       current.summaryGeneratedAt = new Date().toISOString();
       current.summaryStale =
+        audioChanged ||
         inputFingerprint !==
-        JSON.stringify([
-          current.segments,
-          current.annotations,
-          current.speakers,
-        ]);
+          JSON.stringify([
+            current.segments,
+            current.annotations,
+            current.speakers,
+          ]);
       save(current);
       if (settings.autoExport)
         try {
@@ -567,7 +643,7 @@ function configureIPC() {
     return save(m);
   });
   handle("remove", async (id) => {
-    if (recording?.m.id === id || jobs.has(id))
+    if (recording?.m.id === id || jobs.has(id) || speechTasks.running.has(id))
       throw Error("请先结束录制或整理。");
     const r = await dialog.showMessageBox(win, {
       type: "warning",
@@ -586,35 +662,60 @@ function configureIPC() {
   });
   handle("settings", () => publicSettings());
   handle("saveSettings", updateSettings);
-  handle("resolveAppId", async () => {
-    if (!settings.secretId || !settings.secretKey)
-      throw Error("请先保存腾讯密钥。");
-    settings.appId = await getAppId(settings);
-    persistSettings();
-    return publicSettings();
+  handle("codexModels", () => listModels(settings.codexPath));
+  handle("setShortcutCapture", (active) => {
+    shortcutCapture = active === true;
+    if (shortcutCapture) globalShortcut.unregisterAll();
+    else registerShortcuts();
+    return true;
   });
-  handle(
-    "testTencent",
-    () =>
-      new Promise((resolve, reject) => {
-        const cloud = new TencentStream(credentials());
-        const timer = setTimeout(() => {
-          cloud.close();
-          reject(Error("连接超时，请检查网络。"));
-        }, 15000);
-        cloud.once("ready", () => {
-          clearTimeout(timer);
-          cloud.finish();
-          resolve("腾讯实时语音接口连接成功");
-        });
-        cloud.once("issue", (e) => {
-          clearTimeout(timer);
-          cloud.close();
-          reject(e);
-        });
-        cloud.connect();
-      }),
+  handle("speechConfig", () => speechRegistry.public());
+  handle("speechMutate", (action) => speechRegistry.mutate(action));
+  handle("speechTest", async (binding) => {
+    const resolved = speechRegistry.resolve(binding);
+    const audio = fs.readFileSync(
+      path.join(__dirname, "../resources/connection-test.wav"),
+    );
+    try {
+      const result = await speechRuntime.test(binding, audio);
+      speechRegistry.recordTest(binding, resolved.revision, { ok: true });
+      return result;
+    } catch (e) {
+      speechRegistry.recordTest(binding, resolved.revision, {
+        ok: false,
+        message: e.message,
+      });
+      throw e;
+    }
+  });
+  handle("speechResolveAppId", async (id) => {
+    const c = speechRegistry.state.connections.find((c) => c.id === id);
+    if (!c || c.type !== "tencent") throw Error("请选择腾讯连接。");
+    const appId = await getAppId(c);
+    return speechRegistry.mutate({ op: "connection", id, patch: { appId } });
+  });
+  handle("speechTask", (id) => speechTasks.read(id));
+  handle("resumeSpeechTask", (id) =>
+    speechTasks.start(id, null, { resume: true }),
   );
+  handle("cancelSpeechTask", (id) => speechTasks.cancel(id));
+  handle("applyTranscript", (id) => {
+    if (jobs.has(id) || speechTasks.running.has(id) || recording?.m.id === id)
+      throw Error("请等待当前任务完成。");
+    const m = store.get(id);
+    if (!m.pendingTranscript) throw Error("没有可采用的新原文。");
+    atomic(path.join(store.dir(id), "before-apply-" + Date.now() + ".json"), {
+      segments: m.segments,
+      speakers: m.speakers,
+      annotations: m.annotations,
+    });
+    m.transcriptionSource = m.pendingTranscript.source;
+    m.segments = m.pendingTranscript.segments;
+    m.speakers = {};
+    m.pendingTranscript = null;
+    m.summaryStale = !!m.summary;
+    return save(m);
+  });
   handle("health", async () => {
     let status = "未安装";
     try {
@@ -644,7 +745,7 @@ function configureIPC() {
     if (!recording) return false;
     const r = await dialog.showMessageBox(win, {
       type: "question",
-      message: recording.retranscribing ? "停止重新转写？" : "结束这次录制？",
+      message: "结束这次录制？",
       detail: "已录下的音频、原文和批注会保存，并自动关联到 Obsidian。",
       buttons: ["继续录制", "结束并保存"],
       defaultId: 0,
@@ -735,6 +836,12 @@ function configureIPC() {
     m.summaryStale = !!m.summary;
     return save(m);
   });
+  handle("deleteSegment", (id, sid) =>
+    save(transcriptEdit.deleteSegment(store.get(id), sid)),
+  );
+  handle("editSpeakers", (id, changes) =>
+    save(transcriptEdit.editSpeakers(store.get(id), changes)),
+  );
   handle("renameSpeaker", (id, speaker, name) => {
     const m = store.get(id);
     m.speakers[speaker] = String(name).trim();
@@ -849,17 +956,33 @@ function configureIPC() {
       ]);
       const raw = path.join(store.dir(m.id), "import.pcm");
       await run(settings.ffmpegPath, ["-y", "-i", dest, "-f", "s16le", raw]);
-      const pcm = fs.readFileSync(raw);
-      fs.writeFileSync(dest, Buffer.concat([wavHeader(pcm.length), pcm]));
-      fs.unlinkSync(raw);
-      m.durationMs = pcm.length / 32;
-      m.status = "completed";
-      for (let pos = 0; pos < pcm.length; pos += 6400) {
-        let peak = 0;
-        for (let j = pos; j < Math.min(pos + 6400, pcm.length); j += 2)
-          peak = Math.max(peak, Math.abs(pcm.readInt16LE(j)) / 32768);
-        m.peaks.push(peak);
+      const length = fs.statSync(raw).size;
+      const input = fs.openSync(raw, "r"),
+        output = fs.openSync(dest, "w");
+      try {
+        fs.writeSync(output, wavHeader(length));
+        const chunk = Buffer.alloc(6400);
+        for (let pos = 0; pos < length; pos += chunk.length) {
+          const n = fs.readSync(
+            input,
+            chunk,
+            0,
+            Math.min(chunk.length, length - pos),
+            pos,
+          );
+          fs.writeSync(output, chunk, 0, n);
+          let peak = 0;
+          for (let j = 0; j < n; j += 2)
+            peak = Math.max(peak, Math.abs(chunk.readInt16LE(j)) / 32768);
+          m.peaks.push(peak);
+        }
+      } finally {
+        fs.closeSync(input);
+        fs.closeSync(output);
       }
+      fs.unlinkSync(raw);
+      m.durationMs = length / 32;
+      m.status = "completed";
       save(m);
       return m;
     } catch (e) {
@@ -867,68 +990,13 @@ function configureIPC() {
       throw e;
     }
   });
-  handle("retranscribe", async (id) => {
-    if (recording) throw Error("请先结束当前录制。");
-    credentials();
-    const m = store.get(id);
-    const audio = path.join(store.dir(id), "recording.wav");
-    if (!fs.existsSync(audio)) throw Error("没有可用录音");
-    const backup = {
-      segments: m.segments,
-      speakers: m.speakers,
-      annotations: m.annotations,
-    };
-    atomic(
-      path.join(store.dir(id), "before-retranscribe-" + Date.now() + ".json"),
-      backup,
+  handle("retranscribe", async (id, binding) => {
+    if (recording?.m.id === id || jobs.has(id))
+      throw Error("请先结束当前会议的录制或整理。");
+    return speechTasks.start(
+      id,
+      binding || speechRegistry.public().bindings.meeting,
     );
-    m.segments = [];
-    m.speakerContextId = "";
-    m.gaps = [];
-    m.summaryStale = !!m.summary;
-    const fd = fs.openSync(audio, "r");
-    const size = fs.statSync(audio).size;
-    const rec = (recording = {
-      m,
-      offline: false,
-      queue: [],
-      paused: false,
-      ending: false,
-      contextId: "",
-      retranscribing: true,
-      readFd: fd,
-    });
-    m.status = "transcribing";
-    createCloud(rec);
-    let pos = 44;
-    rec.interval = setInterval(() => {
-      if (!rec.cloud?.ready || rec.paused) return;
-      if (pos >= size) {
-        clearInterval(rec.interval);
-        rec.ending = true;
-        void finishCloud(rec).then(() => {
-          fs.closeSync(fd);
-          m.status = "completed";
-          m.connection = null;
-          recording = null;
-          save(m);
-        });
-        return;
-      }
-      const b = Buffer.alloc(Math.min(6400, size - pos));
-      fs.readSync(fd, b, 0, b.length, pos);
-      if (rec.cloud.send(b)) {
-        pos += b.length;
-        rec.replayOffset = (pos - 44) / 32;
-        emit({
-          type: "transcribeProgress",
-          id,
-          progress: (pos - 44) / (size - 44),
-        });
-      }
-    }, 200);
-    save(m);
-    return m;
   });
   handle("reveal", async (id) => {
     shell.showItemInFolder(path.join(store.dir(id), "meeting.json"));
@@ -947,19 +1015,40 @@ function configureIPC() {
 app.whenReady().then(() => {
   loadSettings();
   store = new Store(path.join(settings.dataRoot, "meetings"));
-  if (process.env.AI_MINUTES_IMPORT_CREDENTIALS) {
-    try {
-      Object.assign(
-        settings,
-        JSON.parse(
-          fs.readFileSync(process.env.AI_MINUTES_IMPORT_CREDENTIALS, "utf8"),
-        ),
+  const registryFile = path.join(
+    app.getPath("userData"),
+    "speech-providers.json",
+  );
+  if (!fs.existsSync(registryFile) && fs.existsSync(configPath()))
+    if (
+      !fs.existsSync(
+        path.join(app.getPath("userData"), "settings-before-speech-v1.json"),
+      )
+    )
+      fs.copyFileSync(
+        configPath(),
+        path.join(app.getPath("userData"), "settings-before-speech-v1.json"),
+        fs.constants.COPYFILE_EXCL,
       );
-      persistSettings();
-    } catch (e) {
-      console.error("密钥导入失败：" + e.message);
-    }
-  }
+  speechRegistry = new SpeechRegistry(
+    registryFile,
+    safeStorage,
+    settings,
+    () => [
+      ...(recording?.binding ? [recording.binding] : []),
+      ...[...jobs.values()].map((j) => j.binding).filter(Boolean),
+      ...(speechTasks?.activeBindings() || []),
+    ],
+  );
+  speechRuntime = new SpeechRuntime(speechRegistry);
+  speechTasks = new SpeechTasks(store, speechRegistry, speechRuntime, (m) => {
+    publish(m);
+    scheduleSync(m);
+  });
+  // The registry is now the sole credential store for speech providers.
+  for (const k of ["appId", "hotwords", "secretId", "secretKey"])
+    delete settings[k];
+  persistSettings();
   protocol.handle("media", async (request) => {
     try {
       const u = new URL(request.url);
@@ -1015,13 +1104,30 @@ app.whenReady().then(() => {
       sandbox: true,
     },
   });
+  if (process.env.AI_MINUTES_DATA_DIR)
+    win.on("page-title-updated", (e) => {
+      e.preventDefault();
+      win.setTitle("AI 纪要 · 隔离测试");
+    });
   win.webContents.session.setPermissionRequestHandler((wc, permission, cb) =>
     cb(wc === win.webContents && permission === "media"),
   );
   win.webContents.session.setPermissionCheckHandler(
     (wc, permission) => wc === win.webContents && permission === "media",
   );
+  const restoreShortcuts = () => {
+    if (!shortcutCapture) return;
+    shortcutCapture = false;
+    try {
+      registerShortcuts();
+    } catch (e) {
+      emit({ type: "notice", message: e.message });
+    }
+  };
+  win.on("blur", restoreShortcuts);
+  win.on("closed", restoreShortcuts);
   win.webContents.on("render-process-gone", () => {
+    restoreShortcuts();
     if (recording) void stop();
   });
   win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
@@ -1075,7 +1181,7 @@ app.whenReady().then(() => {
   let closing = false;
   win.on("close", (e) => {
     if (closing) return;
-    if (recording || jobs.size) {
+    if (recording || jobs.size || speechTasks?.running.size) {
       e.preventDefault();
       void dialog
         .showMessageBox(win, {
@@ -1089,13 +1195,11 @@ app.whenReady().then(() => {
         .then(async (r) => {
           if (r.response === 1) {
             for (const job of jobs.values()) job.cancel();
-            if (recording?.retranscribing) {
-              clearInterval(recording.interval);
-              recording.cloud.close();
-              recording.m.status = "interrupted";
-              save(recording.m);
-              recording = null;
-            } else await stop();
+            for (const job of speechTasks.running.values()) job.cancel();
+            if (recording) {
+              recording.after = false;
+              await stop();
+            }
             closing = true;
             win.close();
           }

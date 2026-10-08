@@ -4,7 +4,7 @@ const WebSocket = require("ws");
 function signedURL(c, voiceId, contextId) {
   const now = Math.floor(Date.now() / 1000);
   const p = {
-    engine_model_type: "16k_zh_en_speaker_2.0",
+    engine_model_type: c.model || "16k_zh_en_speaker_2.0",
     expired: now + 86400,
     nonce: crypto.randomInt(1, 2147483647),
     secretid: c.secretId,

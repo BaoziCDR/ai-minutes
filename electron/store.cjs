@@ -89,18 +89,23 @@ class Store {
   }
   save(m, debounce = false) {
     this.cache.set(m.id, m);
+    const write = () => {
+      const savedAt = new Date().toISOString();
+      atomic(path.join(this.dir(m.id), "meeting.json"), { ...m, savedAt });
+      m.savedAt = savedAt;
+    };
     if (this.timers.has(m.id)) clearTimeout(this.timers.get(m.id));
     if (debounce) {
       this.timers.set(
         m.id,
         setTimeout(() => {
           this.timers.delete(m.id);
-          atomic(path.join(this.dir(m.id), "meeting.json"), m);
+          write();
         }, 400),
       );
     } else {
       this.timers.delete(m.id);
-      atomic(path.join(this.dir(m.id), "meeting.json"), m);
+      write();
     }
     return m;
   }
@@ -144,7 +149,7 @@ function transcript(m) {
   return m.segments
     .map(
       (s) =>
-        `### ${clock(s.startMs)} · ${m.speakers[s.speaker] || (s.speaker === "-1" ? "待确认" : `说话人 ${String.fromCharCode(65 + Number(s.speaker))}`)}\n\n${s.text}`,
+        `### ${clock(s.startMs)} · ${m.speakers[s.speaker] || (s.speaker === "-1" ? "未区分说话人" : `说话人 ${String.fromCharCode(65 + (Number(s.speaker.split(":").at(-1)) || 0))}`)}\n\n${s.text}`,
     )
     .join("\n\n");
 }

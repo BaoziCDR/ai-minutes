@@ -1,3 +1,61 @@
+export type SpeechBinding = {
+  connectionId: string;
+  profileId: string;
+  mode: "realtime" | "after";
+};
+export type SpeechConnection = {
+  id: string;
+  name: string;
+  type: "tencent" | "compatible";
+  baseUrl: string;
+  appId: string;
+  enabled: boolean;
+  revision: number;
+  [key: string]: any;
+};
+export type SpeechProfile = {
+  id: string;
+  connectionId: string;
+  name: string;
+  kind: string;
+  model: string;
+  hotwords: string;
+  enabled: boolean;
+  revision: number;
+  capabilities: any;
+  test?: { at: string; ok: boolean };
+};
+export type SpeechConfig = {
+  connections: SpeechConnection[];
+  profiles: SpeechProfile[];
+  bindings: { meeting: SpeechBinding | null; review: SpeechBinding | null };
+  reviewBudgetSeconds: number;
+};
+export type AudioReview = {
+  runId: string;
+  state: string;
+  uploadedMs: number;
+  error: string;
+  clips: Array<{
+    startMs: number;
+    endMs: number;
+    reason: string;
+    original: string;
+    text?: string;
+    error?: string;
+    state: string;
+    cached?: boolean;
+    source?: { provider: string; model: string };
+  }>;
+};
+export type CodexModel = {
+  id: string;
+  displayName: string;
+  description: string;
+  isDefault: boolean;
+  supportedReasoningEfforts: string[];
+  defaultReasoningEffort: string;
+};
 export type Segment = {
   id: string;
   text: string;
@@ -5,6 +63,7 @@ export type Segment = {
   startMs: number;
   endMs: number;
   final: boolean;
+  timing?: "segment" | "clip" | "none";
   edited?: boolean;
   originalText?: string;
 };
@@ -20,6 +79,7 @@ export type Annotation = {
   createdAt: string;
 };
 export type Summary = {
+  audioReview?: AudioReview;
   overview: string;
   topics: { title: string; detail: string; sourceIds: string[] }[];
   decisions: { text: string; sourceIds: string[] }[];
@@ -45,6 +105,21 @@ export type Meeting = {
   gaps: { startMs: number; endMs: number; reason: string }[];
   favorite: boolean;
   summary: Summary | null;
+  summaryGeneratedAt?: string;
+  speechTask?: {
+    id: string;
+    state: string;
+    completed: number;
+    total: number;
+    error: string;
+    source: any;
+  };
+  pendingTranscript?: {
+    taskId: string;
+    segments: Segment[];
+    source: any;
+  } | null;
+  transcriptionSource?: any;
   summaryStatus?: string;
   summaryError?: string;
   summaryStale?: boolean;
@@ -52,6 +127,7 @@ export type Meeting = {
   lastError?: string;
   exportPath?: string;
   exportedAt?: string;
+  savedAt?: string;
   syncState?: string;
   syncError?: string;
 };
@@ -74,6 +150,8 @@ export type Settings = {
   vaultPath: string;
   vaultFolder: string;
   codexPath: string;
+  codexModel: string;
+  codexReasoningEffort: string;
   ffmpegPath: string;
   summaryProvider: "codex" | "api";
   apiBase: string;
@@ -82,15 +160,26 @@ export type Settings = {
   autoExport: boolean;
 };
 export type API = {
+  speechConfig: () => Promise<SpeechConfig>;
+  speechMutate: (action: any) => Promise<SpeechConfig>;
+  speechTest: (
+    binding: SpeechBinding,
+  ) => Promise<{ ok: boolean; message: string }>;
+  speechResolveAppId: (id: string) => Promise<SpeechConfig>;
+  speechTask: (id: string) => Promise<any>;
+  resumeSpeechTask: (id: string) => Promise<Meeting>;
+  cancelSpeechTask: (id: string) => Promise<boolean>;
+  applyTranscript: (id: string) => Promise<Meeting>;
+
   list: () => Promise<Meeting[]>;
   get: (id: string) => Promise<Meeting>;
   create: (t: string) => Promise<Meeting>;
   patch: (id: string, p: Partial<Meeting>) => Promise<Meeting>;
   remove: (id: string) => Promise<boolean>;
   settings: () => Promise<Settings>;
+  codexModels: () => Promise<CodexModel[]>;
   saveSettings: (s: Partial<Settings>) => Promise<Settings>;
-  resolveAppId: () => Promise<Settings>;
-  testTencent: () => Promise<string>;
+  setShortcutCapture: (active: boolean) => Promise<boolean>;
   health: () => Promise<{
     codex: string;
     codexInstalled: boolean;
@@ -120,6 +209,11 @@ export type API = {
     sid: string,
     p: Partial<Segment>,
   ) => Promise<Meeting>;
+  deleteSegment: (id: string, sid: string) => Promise<Meeting>;
+  editSpeakers: (
+    id: string,
+    changes: { id: string; name: string; deleted: boolean }[],
+  ) => Promise<Meeting>;
   renameSpeaker: (id: string, s: string, n: string) => Promise<Meeting>;
   generate: (id: string) => Promise<Meeting>;
   cancelSummary: (id: string) => Promise<void>;
@@ -127,7 +221,7 @@ export type API = {
   exportBundle: (id: string) => Promise<string | null>;
   exportHighlights: (id: string) => Promise<string | null>;
   importAudio: () => Promise<Meeting | null>;
-  retranscribe: (id: string) => Promise<Meeting>;
+  retranscribe: (id: string, binding?: SpeechBinding) => Promise<Meeting>;
   reveal: (id: string) => Promise<void>;
   openObsidian: (id: string) => Promise<void>;
   onUpdate: (cb: (d: any) => void) => () => void;
