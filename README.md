@@ -1,104 +1,239 @@
-# AI 纪要 · AI Minutes
+<div align="center">
 
-React + TypeScript + Electron 编写的 macOS 会议 App。腾讯云实时分人转写，Codex 或 OpenAI 兼容 API 会后整理。
+# AI Minutes · AI 纪要
 
-## 日常使用
+**A macOS meeting recorder with real-time speaker-separated transcription, AI-generated minutes, and automatic Obsidian archiving.**
 
-1. 在“设置与连接 → 语音供应商”管理连接和模型，填写对应凭据并测试音频；在“会议转写”选择模型和实时／会后模式。旧腾讯设置升级后自动迁移。
-2. 选择麦克风，新建会议、开始录音。快捷键可在设置中修改。
-3. 在原文中划线，浮动气泡提供 **重点、待办、决策、疑问** 四类图标。选类型即保存，不必填备注；需要时展开备注框，完成或点击外部时保存。
-4. 暂停／继续共用一个操作。继续时检查实际音频采集，若原音频会话卡住会自动重新打开麦克风并接着写入同一会议；设备仍不可用时保持暂停，可以检查设备后重试。点击或通过快捷键结束录制时，会先弹出确认，取消后继续录音。
-5. 会后可回听、修改原文与人员姓名。回放进度条按实际录音音量显示波形，较轻的声音也能看清；最近保存时间显示在顶部“已自动保存”左侧。点击“生成纪要”，得到结构化纪要、思维导图、待办及决策。
+**English** · [简体中文](README.zh-CN.md)
 
-## 保存与自动关联
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+![Platform](https://img.shields.io/badge/platform-macOS%20(Apple%20Silicon)-lightgrey)
+![Electron](https://img.shields.io/badge/Electron-40-47848F?logo=electron&logoColor=white)
+![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)
+![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?logo=typescript&logoColor=white)
 
-- 默认会议数据根目录：`~/.ai-minutes`，可在设置中修改。会议保存在其 `meetings/` 下。
-- 切换根目录前需结束录制和整理。已有会议复制到新根目录，旧目录保留作为备份；不会覆盖目标中的同 ID 数据，也不允许把用户数据放进源码或 Git 仓库。
-- 默认 Obsidian 库：`~/basic-memory`。可以选择其他现有库，库内会议目录默认“会议记录”。
-- 每场会议自动建立入口页，录音、原文和分类批注自动关联；AI 结果生成后自动同步。无需点击导入按钮。
-- 默认按“年 / 月 / 日期＋主题＋短 ID”组织。修改会议标题不改变已建立的目录，避免重复归档。
-- 同一文件系统内，Obsidian 录音采用硬链接，录制中持续更新且不重复占用音频空间；跨文件系统时录制结束后复制录音。
-- 同步失败时保留本地数据，并在会议页显示原因及重试入口。更改库路径后会自动关联已有会议。
+</div>
 
-典型 Obsidian 结构：
+---
+
+## Table of Contents
+
+- [Features](#features)
+- [How It Works](#how-it-works)
+- [Requirements](#requirements)
+- [Quick Start](#quick-start)
+- [Usage](#usage)
+- [Data & Privacy](#data--privacy)
+- [Obsidian Layout](#obsidian-layout)
+- [Development](#development)
+- [Project Structure](#project-structure)
+- [FAQ](#faq)
+- [Contributing](#contributing)
+- [License](#license)
+
+## Features
+
+- 🎙️ **Real-time, speaker-separated transcription**: live captions with diarization via Tencent Cloud ASR.
+- 🔌 **Multiple speech providers**: Tencent real-time ASR, Tencent file ASR, and any OpenAI-compatible `/audio/transcriptions` or `/chat/completions` endpoint, hosted over HTTPS or running on `localhost`.
+- ⏺️ **Live or post-meeting mode**: transcribe while you record, or record first and transcribe when the meeting ends.
+- ✍️ **Highlight annotations**: select transcript text and tag it as **Key point / To-do / Decision / Question** in one click; notes are optional.
+- 🧠 **AI minutes**: generate structured minutes, a Mermaid mind map, to-dos and decisions with your local [Codex CLI](https://github.com/openai/codex) or any OpenAI-compatible chat model API.
+- 🔍 **Independent audio review**: an optional second speech model re-listens to passages the AI flags as doubtful. Usage is capped, and the original transcript is never overwritten.
+- 🗂️ **Automatic Obsidian sync**: every meeting gets a hub page, transcript, annotations and minutes, plus a running meeting index.
+- 🛟 **Resilient recording**: 16 kHz WAV saved locally, automatic reconnection with recognition gaps marked, automatic recovery from stuck microphones, and crash recovery.
+- 🎧 **Post-meeting editing**: waveform playback, variable speed, click-to-seek from the transcript, speaker renaming, MP3 export of highlights, and re-transcription with version history.
+- ⌨️ **Global shortcuts**: start/stop, pause/resume and new meeting, all customizable.
+- 🔐 **Encrypted credentials**: secrets are encrypted with macOS secure storage (Electron `safeStorage`), shown only as "configured" in the UI, and never included in exports.
+
+## How It Works
 
 ```text
-会议记录/
-  会议索引.md
-  2026/09/2026-09-22 项目讨论 abc123/
-    会议.md            # 元信息、录音、结论和资料导航
-    录音.wav
-    原文.md            # 时间戳和发言人，可被纪要引用
-    重点批注.md         # 分类 callout 和备注
-    纪要.md
-    思维导图.md         # Mermaid
-    待办.md
-    决策.md
-    录音复核.md       # 独立语音模型的核对结果与差异
-    会议数据.json
+Microphone ──► AudioWorklet (16 kHz PCM) ──► local WAV
+                                       │
+                                       └──► Speech provider (Tencent / OpenAI-compatible) ──► diarized transcript
+                                                                                          │
+                                  Highlights (key point / to-do / decision / question) ◄──┤
+                                                                                          ▼
+                                     Codex CLI or chat model API ──► minutes · mind map · to-dos · decisions
+                                                                                          │
+                                                                                          ▼
+                                                                          Obsidian vault (auto-sync)
 ```
 
-再次自动同步会更新这些由 App 生成的文件；需要保留独立手工编辑时，请另建笔记。删除 App 内会议会移入废纸篓，已经关联的 Obsidian 文件保留。
+## Requirements
 
-## 设置与密钥
+| Dependency | Notes |
+| --- | --- |
+| macOS (Apple Silicon) | Only arm64 builds are provided |
+| Node.js 22+ | Needed to build from source |
+| Speech recognition | Tencent Cloud ASR SecretId / SecretKey, or any OpenAI-compatible transcription endpoint |
+| AI summarization (either one) | A signed-in [Codex CLI](https://github.com/openai/codex) recent enough to support permission profiles, or an OpenAI-compatible chat model API |
+| FFmpeg (optional) | Needed to import external audio and export highlight MP3s |
+| Obsidian (optional) | Needed for automatic archiving |
 
-设置自动保存，无需点击保存按钮。Codex 模型列表通过本机 CLI 的 `model/list` 接口读取，支持刷新；推理程度按模型能力提供，默认使用“中”。选择的模型与推理程度会传入每次整理命令。选择项立即生效；普通文字停止输入后自动保存，路径及密钥离开输入框后保存；关闭设置时会等待保存完成，失败时保留输入并显示原因，正常保存不显示常驻说明。设置界面尺寸固定，内容区内部滚动。支持识别配置、录音设备、全局快捷键、AI 整理、保存目录、Obsidian 库和外观。
+## Quick Start
 
-腾讯及文字模型密钥使用 macOS 安全存储加密；界面只返回“已配置”，导出和源码不包含密钥。应用偏好及加密设置由 Electron 放在用户的 Application Support 目录中，会议数据遵循上方可配置根目录。
-
-默认快捷键（macOS 上 CommandOrControl 即 ⌘）：
-
-- 开始／结束：`CommandOrControl+Shift+R`
-- 暂停／继续：`CommandOrControl+Shift+P`
-- 新建会议：`CommandOrControl+Alt+N`
-
-点击快捷键输入框后直接按组合键，录入成功立即保存。Esc 取消，Delete / Backspace 清除并禁用。录入期间暂停全局快捷键，自动检查重复与占用，失败时保留原绑定。快捷键会打开 App；结束录制与按钮使用相同的确认流程。
-
-## 音频与整理
-
-录音为 16 kHz / 16 bit / 单声道 WAV，约 115 MB／小时。支持导入音频、倍速回听、按原文定位、导出重点 MP3。导入与重点音频需要 FFmpeg，可配置其路径。
-
-Codex 使用本机已有登录，通过 `codex exec` 只读整理输入，结果由 App 保存。选择 ChatGPT 登录时使用对应 Codex 额度；也可以配置自有文字模型 API。录音上传至配置的腾讯服务，原文及批注在会后提交给所选整理服务。
-
-不人为限定会议长度。断线仍保留录音，自动重连并标记识别缺口；意外退出后恢复已写入数据。真实收音、说话人识别和网络延迟取决于现场条件。
-
-## 开发与验证
-
-Node.js 22+，macOS Apple Silicon。
-
-```sh
+```bash
+git clone https://github.com/BaoziCDR/ai-minutes.git
+cd ai-minutes
 npm ci
 npm run build
 npm start
-npm test
-npm run test:desktop
+```
+
+To build a macOS app:
+
+```bash
 npm run dist
 ```
 
-安装包输出到 `release/`。默认单元与桌面测试使用系统临时目录及合成资料，不读取用户会议库，不包含真实密钥。录音回归测试覆盖真实 AudioWorklet → IPC → WAV 流程，以及音频恢复卡住、恢复无输出、设备不可用后重试。显式设置 `AI_MINUTES_REAL_CLOUD=1` 时，录音测试才使用本机已加密的腾讯配置和合成中文语音验证云端连接，测试结束删除临时数据。`AI_MINUTES_REAL_MIC=1` 则使用当前麦克风做离线录音复测，不上传音频。`AI_MINUTES_DATA_DIR` 仅供隔离测试使用；配置文件位于该目录，默认测试数据位于其 `data/` 子目录。
+The installer is written to `release/`.
 
-- `electron/main.cjs`：桌面生命周期、IPC、录音与整理调度。
-- `electron/tencent.cjs`：腾讯签名、实时连接和说话人事件。
-- `electron/obsidian.cjs`：自动关联、结构化页面、会议索引。
-- `electron/storage.cjs`：保存根目录校验和迁移。
-- `electron/shortcuts.cjs`：全局快捷键注册和校验。
-- `src/SelectionBubble.tsx`：划线气泡、类型和可选备注。
-- `src/main.tsx`、`src/styles.css`：React 界面和主题。
+> [!NOTE]
+> The app is not signed or notarized by Apple. If macOS says the app is "damaged" or from an unidentified developer, and you trust where it came from, remove the quarantine attribute:
+>
+> ```bash
+> xattr -dr com.apple.quarantine "/Applications/AI 纪要.app"
+> ```
 
-为兼容前一版本，保留原 bundle ID，显示名称为“AI 纪要”，英文名“AI Minutes”。升级时保留旧版用户数据。安装包未申请 Apple 公证，适合本机使用。
+## Usage
 
-## 1.2 供应商与独立复核
+1. **Set up a speech provider**: open *Settings & Connections → Speech Providers*, add a connection with your credentials, and click *Test audio*. Under *Meeting transcription*, pick a model and choose live or post-meeting mode.
+2. **Record**: choose a microphone, create a meeting and start recording.
+3. **Annotate**: select transcript text and pick a tag from the floating bubble. It saves immediately, and a note is optional.
+4. **Pause / stop**: pause and resume share one button. Stopping asks for confirmation first.
+5. **Generate minutes**: after the meeting, review the audio, fix the transcript and speaker names, then click *Generate minutes*.
 
-语音凭据统一存放在应用数据目录的 `speech-providers.json`，通过 macOS 安全存储加密。命名连接可共享多个模型，会议转写和独立录音复核只保存引用。旧配置备份为 `settings-before-speech-v1.json`；原有会议不重转写。
+### Default Shortcuts
 
-支持腾讯实时识别、腾讯文件异步识别、OpenAI 兼容 `/audio/transcriptions`、兼容音频理解 `/chat/completions`。可填写 HTTPS 云端地址或 localhost / 127.0.0.1 本地服务地址。兼容模型的分人与时间戳能力默认显示未知；测试仅确认该次请求成功，不替模型宣称能力。音频理解接口专用于复核。
+| Action | Shortcut |
+| --- | --- |
+| Start / stop recording | `⌘ ⇧ R` |
+| Pause / resume | `⌘ ⇧ P` |
+| New meeting | `⌘ ⌥ N` |
 
-会后模式先录音、结束后自动转写。文件分片不超过 60 秒；腾讯异步采用上传和轮询，不需要 COS 或公网回调。没有分人信息时显示“未区分说话人”，没有句级时间戳时仅显示片段范围。不同文件分片的说话人不会自动合并。发言人可手动添加，再在修订原文中归属。
+All shortcuts can be changed in Settings: click the field and press the new combination. `Esc` cancels and `Delete` clears it.
 
-重新转写保留版本。有人工编辑、姓名或批注时，新原文先作为待采用版本展示。失败不清空原文。异步任务可恢复已提交部分的查询；未提交和提交结果不确定的部分不会自动重发。取消停止本地工作，远端任务可能继续运行。
+### Where Data Lives
 
-录音复核默认不配置供应商。配置独立模型后，Codex 或文字 API 自主选择疑点，最多两轮、十次实际音频请求，默认上传总计不超过五分钟（包含上下文与重试）；上限可调。复核结果保留出处、差异和回听位置，不覆盖原文；未配置或失败时继续文字整理，不回退腾讯。相同录音、范围、模型配置和问题可以使用缓存。
+| Content | Default location |
+| --- | --- |
+| Meetings | `~/.ai-minutes/meetings/` (the root folder can be changed in Settings) |
+| Settings and encrypted credentials | `~/Library/Application Support/AI 纪要/` |
+| Obsidian vault | `~/basic-memory`, using the `会议记录` folder inside it (both configurable) |
 
-每次整理保存独立输入快照。Codex 文件权限只允许快照和最小运行文件，本地命令不允许联网；语音请求由 App 发起，模型无法取得供应商密钥。任务期间改变设置仅作用于后续任务。需要支持 permission profiles 的新版 Codex CLI。
+Recordings are 16 kHz / 16-bit / mono WAV, about 115 MB per hour.
 
-`npm test` 包含适配器、迁移、预算、版本与 macOS 文件隔离测试；`npm run test:desktop` 包含界面、实际 PCM 录音流水线和本地模拟语音 API 的完整流程。供应商真实调用仍需对应账号权限，未配置的独立接口不会被标记为已验证。
+## Data & Privacy
+
+AI Minutes is local-first. **It has no backend of its own and collects no telemetry.** To transcribe and summarize, it sends some data to **third-party services that you configure yourself**:
+
+| Data | Sent to |
+| --- | --- |
+| Meeting audio | Your configured speech provider (e.g. Tencent Cloud ASR, an OpenAI-compatible endpoint) |
+| Transcript and highlights | Your chosen summarization service (Codex / chat model API) |
+| Audio clips for review | Only the independent review model, and only if you configure one |
+
+- Credentials are encrypted with macOS secure storage, and the renderer process only ever sees whether they are configured.
+- Codex runs read-only with network access disabled. It can only see the input snapshot for the current task and never receives your speech provider credentials.
+- Get consent from everyone in the meeting before you record, and follow local laws and your organization's policies.
+
+## Obsidian Layout
+
+The app writes these files with Chinese names:
+
+```text
+会议记录/                    # Meetings
+  会议索引.md                # Meeting index
+  2026/09/2026-09-22 Project sync abc123/
+    会议.md                  # Hub: metadata, audio, conclusions, links
+    录音.wav                 # Recording
+    原文.md                  # Transcript with timestamps and speakers
+    重点批注.md               # Highlights as callouts with notes
+    纪要.md                  # Minutes
+    思维导图.md               # Mind map (Mermaid)
+    待办.md                  # To-dos
+    决策.md                  # Decisions
+    录音复核.md               # Audio review results
+    会议数据.json             # Raw meeting data
+```
+
+When the vault is on the same filesystem, the recording is hard-linked, so it takes no extra space. The app regenerates these files on every sync, so put your own manual notes in separate files.
+
+## Development
+
+```bash
+npm run dev            # Vite dev server only (renderer)
+npm run build          # Type-check and build
+npm start              # Launch Electron
+npm test               # Unit tests (adapters, migration, budgets, versioning, sandbox)
+npm run test:desktop   # E2E tests (UI, PCM recording pipeline, mock speech APIs)
+npm run format         # Prettier
+```
+
+By default, tests use the system temp directory and synthetic data. They never touch your meeting library and need no real credentials. These optional environment variables run checks against real services:
+
+| Variable | Effect |
+| --- | --- |
+| `AI_MINUTES_REAL_CLOUD=1` | Checks the cloud connection with your locally encrypted Tencent credentials and synthetic speech |
+| `AI_MINUTES_REAL_MIC=1` | Records offline from the current microphone; no audio is uploaded |
+| `AI_MINUTES_LIVE_CHECK=1` | Calls the providers configured in the installed app |
+| `AI_MINUTES_DATA_DIR` | Isolated data directory, for tests only |
+
+## Project Structure
+
+```text
+electron/
+  main.cjs             # App lifecycle, IPC, recording and summarization orchestration
+  tencent.cjs          # Tencent request signing, real-time stream, speaker events
+  speech/              # Speech provider registry, runtime, async tasks, audio utilities
+  summary.cjs          # AI minutes generation
+  review.cjs           # Independent audio review
+  obsidian.cjs         # Obsidian sync and meeting index
+  storage.cjs          # Data root validation and migration
+  shortcuts.cjs        # Global shortcuts
+src/
+  main.tsx             # React UI
+  SelectionBubble.tsx  # Highlight bubble
+  SpeechSettings.tsx   # Speech provider settings
+  AudioReviewView.tsx  # Audio review view
+  recorder.ts          # AudioWorklet recorder
+public/pcm-worklet.js  # PCM capture worklet
+tests/                 # Unit tests and Playwright Electron E2E tests
+```
+
+## FAQ
+
+<details>
+<summary><b>Does it run on Windows or Linux?</b></summary>
+
+Not yet. Credential encryption, hard-link syncing and the packaging config are all macOS-specific. Pull requests for other platforms are welcome.
+</details>
+
+<details>
+<summary><b>Can it run fully offline?</b></summary>
+
+Yes. Point transcription at an OpenAI-compatible server on `localhost` (for example, a self-hosted Whisper), and use a local model API for summarization.
+</details>
+
+<details>
+<summary><b>Is there a maximum meeting length?</b></summary>
+
+No artificial limit. Audio is written to disk continuously, and after a network drop the app reconnects and marks the recognition gap in the transcript.
+</details>
+
+## Contributing
+
+Issues and pull requests are welcome!
+
+1. Fork the repo and create a branch: `git checkout -b feat/your-feature`
+2. Run `npm test` and `npm run format` before committing
+3. Open a pull request describing what changed and how you tested it
+
+## License
+
+Released under the [MIT License](LICENSE).
+
+## Acknowledgements
+
+[Electron](https://www.electronjs.org/) · [React](https://react.dev/) · [Vite](https://vite.dev/) · [Mermaid](https://mermaid.js.org/) · [Lucide](https://lucide.dev/) · [Tencent Cloud ASR](https://www.tencentcloud.com/products/asr) · [Codex CLI](https://github.com/openai/codex)
