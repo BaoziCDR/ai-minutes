@@ -3,7 +3,13 @@
   "version": "1.2.1",
   "private": true,
   "description": "AI 纪要 · AI Minutes",
-  "author": "Jume",
+  "author": "BaoziCDR",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BaoziCDR/ai-minutes.git"
+  },
+  "homepage": "https://github.com/BaoziCDR/ai-minutes#readme",
   "main": "electron/main.cjs",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
